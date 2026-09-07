@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "CodexProviderManager",
+  "productName": "Codex Idea Tool",
   "version": "0.1.1",
   "identifier": "com.codex.providermanager",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Codex Provider Manager",
+        "title": "Codex Idea Tool",
         "width": 960,
         "height": 700,
         "minWidth": 840,
