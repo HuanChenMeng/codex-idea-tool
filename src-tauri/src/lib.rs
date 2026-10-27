@@ -1,8 +1,8 @@
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::{HashMap, HashSet}, fs, io::Write, path::{Path, PathBuf}, process::Command, time::{Duration, Instant}};
+use std::{collections::{HashMap, HashSet}, fs, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::Command, sync::Mutex, time::{Duration, Instant}};
 use std::os::windows::process::CommandExt;
 use tauri::Manager;
 use windows_sys::Win32::{Foundation::{CloseHandle, INVALID_HANDLE_VALUE}, System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS}};
@@ -33,6 +33,8 @@ struct Account {
 #[derive(Clone, Serialize, Deserialize)] #[serde(rename_all = "camelCase")] struct LaunchRecord { pid: u32, label: String }
 #[derive(Serialize)] #[serde(rename_all = "camelCase")] struct RuntimeStatus { state: String, label: String, detail: String }
 #[derive(Serialize)] #[serde(rename_all = "camelCase")] struct AppData { providers: Vec<ProviderView>, accounts: Vec<AccountView>, runtime_status: RuntimeStatus, recent_logs: Vec<String>, config_dir: String, profiles_dir: String, logs_dir: String }
+#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+struct ScheduledMessageRecord { recorded_at:String, account:String, scheduled_slot:String, model:String, prompt:String, status:String, response:String, error:String }
 #[derive(Clone, Serialize)] #[serde(rename_all = "camelCase")] struct UsageWindow { remaining_percent: f64, resets_at: Option<i64> }
 #[derive(Clone, Serialize)] #[serde(rename_all = "camelCase")] struct UsageProfile { scope: String, label: String, source: String, primary: Option<UsageWindow>, secondary: Option<UsageWindow>, monthly: Option<UsageWindow>, reset_credits: u32, plan_type: Option<String>, error: Option<String> }
 #[allow(dead_code)] #[derive(Clone, Deserialize)] #[serde(rename_all = "camelCase")] struct CliProxyInput { base_url: String, management_key: String }
@@ -50,7 +52,49 @@ fn launch_record_path() -> AppResult<PathBuf> { Ok(config_dir()?.join("idea-laun
 fn stamp() -> String { Local::now().format("%Y%m%d-%H%M%S-%3f").to_string() }
 fn escape(s: &str) -> String { s.replace('\\', "\\\\").replace('"', "\\\"") }
 fn redact(s:&str)->String { Regex::new(r#"(?i)(bearer\s+|api[_-]?key[\"']?\s*[:=]\s*[\"']?)[^\s\"',;}]+"#).map(|r|r.replace_all(s,"$1[REDACTED]").into_owned()).unwrap_or_else(|_|s.into()) }
-fn log_entry(kind:&str,message:&str){if let Ok(dir)=logs_dir(){let _=fs::create_dir_all(&dir);let path=dir.join(format!("ci-{}.log",Local::now().format("%Y-%m-%d")));let line=format!("[{}] [{}]\r\n{}\r\n\r\n",Local::now().format("%Y-%m-%d %H:%M:%S%.3f %:z"),kind,redact(message));if let Ok(mut f)=fs::OpenOptions::new().create(true).append(true).open(path){let _=f.write_all(line.as_bytes());}}}
+fn prune_logs_at(dir:&Path,today:NaiveDate)->usize{
+ let cutoff=today-chrono::Duration::days(6);
+ let Ok(entries)=fs::read_dir(dir)else{return 0};
+ let mut removed=0;
+ for entry in entries.flatten(){
+  if !entry.file_type().is_ok_and(|kind|kind.is_file()){continue}
+  let name=entry.file_name();
+  let Some(date)=name.to_str().and_then(|name|name.strip_prefix("ci-").and_then(|name|name.strip_suffix(".log")).or_else(||name.strip_prefix("scheduled-messages-").and_then(|name|name.strip_suffix(".jsonl")))).and_then(|date|NaiveDate::parse_from_str(date,"%Y-%m-%d").ok())else{continue};
+  if date<cutoff&&fs::remove_file(entry.path()).is_ok(){removed+=1}
+ }
+ removed
+}
+fn log_entry(kind:&str,message:&str){if let Ok(dir)=logs_dir(){let _=fs::create_dir_all(&dir);prune_logs_at(&dir,Local::now().date_naive());let path=dir.join(format!("ci-{}.log",Local::now().format("%Y-%m-%d")));let line=format!("[{}] [{}]\r\n{}\r\n\r\n",Local::now().format("%Y-%m-%d %H:%M:%S%.3f %:z"),kind,redact(message));if let Ok(mut f)=fs::OpenOptions::new().create(true).append(true).open(path){let _=f.write_all(line.as_bytes());}}}
+fn append_scheduled_message(record:&ScheduledMessageRecord){
+ let Ok(dir)=logs_dir()else{return};
+ if fs::create_dir_all(&dir).is_err(){return}
+ prune_logs_at(&dir,Local::now().date_naive());
+ let path=dir.join(format!("scheduled-messages-{}.jsonl",Local::now().format("%Y-%m-%d")));
+ if let Ok(mut file)=fs::OpenOptions::new().create(true).append(true).open(path){
+  if let Ok(line)=serde_json::to_string(record){let _=writeln!(file,"{line}");}
+ }
+}
+fn read_scheduled_message_history(dir:&Path)->Vec<ScheduledMessageRecord>{
+ let Ok(entries)=fs::read_dir(dir)else{return vec![]};
+ let mut records=Vec::new();
+ for entry in entries.flatten(){
+  if !entry.file_type().is_ok_and(|kind|kind.is_file()){continue}
+  let name=entry.file_name();
+  if !name.to_str().is_some_and(|name|name.starts_with("scheduled-messages-")&&name.ends_with(".jsonl")){continue}
+  if let Ok(file)=fs::File::open(entry.path()){
+   for line in BufReader::new(file).lines().map_while(Result::ok){
+    if let Ok(record)=serde_json::from_str::<ScheduledMessageRecord>(&line){records.push(record)}
+   }
+  }
+ }
+ records.sort_by(|a,b|b.recorded_at.cmp(&a.recorded_at));
+ records
+}
+#[tauri::command] fn load_scheduled_message_history()->Vec<ScheduledMessageRecord>{
+ let Ok(dir)=logs_dir()else{return vec![]};
+ prune_logs_at(&dir,Local::now().date_naive());
+ read_scheduled_message_history(&dir)
+}
 fn backup(path:&Path)->AppResult<()> { if path.exists(){fs::copy(path,format!("{}.backup-{}",path.display(),stamp())).map_err(|e|format!("创建备份失败：{e}"))?;} Ok(()) }
 fn atomic_write(path:&Path,text:&str)->AppResult<()> {if let Some(dir)=path.parent(){fs::create_dir_all(dir).map_err(|e|e.to_string())?;}let tmp=path.with_extension("ci.tmp");fs::write(&tmp,text.as_bytes()).map_err(|e|e.to_string())?;fs::rename(tmp,path).map_err(|e|e.to_string())}
 fn read_json<T:for<'a>Deserialize<'a>+Default>(p:&Path)->T{fs::read_to_string(p).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or_default()}
@@ -89,8 +133,8 @@ struct AccountExport { name: String, auth: Value }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountExportBundle { format: String, version: u32, exported_at: String, accounts: Vec<AccountExport> }
-fn available_credits(result:&Value)->u32{result.get("rateLimitResetCredits").and_then(|v|v.get("availableCount")).and_then(Value::as_u64).or_else(||result.get("credits").and_then(Value::as_array).map(|items|items.iter().filter(|item|item.get("status").and_then(Value::as_str)==Some("available")).count() as u64)).unwrap_or(0) as u32}
-fn usage_profile(scope:String,label:String,source:&str,result:Value,credits:Option<Value>)->UsageProfile{let snapshot=result.get("rateLimitsByLimitId").and_then(|v|v.get("codex")).or_else(||result.get("rateLimits")).or_else(||result.get("rate_limit"));let credit_source=credits.as_ref().unwrap_or(&result);let(primary,secondary,monthly)=usage_windows(snapshot);UsageProfile{scope,label,source:source.into(),primary,secondary,monthly,reset_credits:available_credits(credit_source),plan_type:snapshot.and_then(|v|v.get("planType").or_else(||v.get("plan_type"))).and_then(Value::as_str).map(str::to_owned),error:None}}
+fn available_credits(result:&Value)->u32{result.get("rateLimitResetCredits").or_else(||result.get("rate_limit_reset_credits")).and_then(|v|v.get("availableCount").or_else(||v.get("available_count"))).and_then(Value::as_u64).or_else(||result.get("credits").and_then(Value::as_array).map(|items|items.iter().filter(|item|item.get("status").and_then(Value::as_str)==Some("available")).count() as u64)).unwrap_or(0) as u32}
+fn usage_profile(scope:String,label:String,source:&str,result:Value,credits:Option<Value>)->UsageProfile{let snapshot=result.get("rateLimitsByLimitId").and_then(|v|v.get("codex")).or_else(||result.get("rateLimits")).or_else(||result.get("rate_limit"));let credit_source=credits.as_ref().unwrap_or(&result);let(primary,secondary,monthly)=usage_windows(snapshot);UsageProfile{scope,label,source:source.into(),primary,secondary,monthly,reset_credits:available_credits(credit_source),plan_type:result.get("plan_type").or_else(||result.get("planType")).or_else(||snapshot.and_then(|v|v.get("planType").or_else(||v.get("plan_type")))).and_then(Value::as_str).map(str::to_owned),error:None}}
 fn usage_error(scope:String,label:String,source:&str,error:String)->UsageProfile{UsageProfile{scope,label,source:source.into(),primary:None,secondary:None,monthly:None,reset_credits:0,plan_type:None,error:Some(error)}}
 fn profile_home(scope:&str)->AppResult<(PathBuf,String)>{if scope=="default"{let home=default_codex_home().ok_or("无法读取默认 Codex 目录。")?;if !home.join("auth.json").exists(){return Err("默认 Codex 登录态不存在。".into())}return Ok((home,"默认 Codex 登录态".into()))}let account=load_accounts()?.into_iter().find(|a|a.id==scope).ok_or("账号不存在。")?;let home=profiles_dir()?.join(&account.id);if !home.join("auth.json").exists(){return Err("该账号尚未登录或导入认证。".into())}Ok((home,format!("OpenAI · {}",account.name)))}
 #[allow(dead_code)] fn local_usage_limits()->AppResult<Vec<UsageProfile>>{let accounts=load_accounts()?;let mut candidates=vec![];if let Some(home)=default_codex_home(){if home.join("auth.json").exists(){candidates.push(("default".to_string(),"默认 Codex 登录态".to_string(),home))}}for account in accounts{let home=profiles_dir()?.join(&account.id);if home.join("auth.json").exists(){candidates.push((account.id,format!("OpenAI · {}",account.name),home))}}let mut seen=HashSet::new();let mut profiles=vec![];for (scope,label,home) in candidates{match app_server_request(&home,"account/rateLimits/read",json!({"excludeResetCreditDetails":false,"supportsLunaReserve":false})){Ok(result)=>{let account_id=result.get("accountId").and_then(Value::as_str).unwrap_or(&scope).to_owned();if seen.insert(account_id){profiles.push(usage_profile(scope,label,"local",result,None));}},Err(error)=>profiles.push(usage_error(scope,label,"local",error))}}if profiles.is_empty(){return Err("没有已登录的本机 Codex 账号可查询。".into())}Ok(profiles)}
@@ -107,9 +151,39 @@ fn reset_proxy_usage(input:&CliProxyInput,scope:&str)->AppResult<String>{let ind
 #[tauri::command] fn legacy_reset_usage_limit(scope:String,cli_proxy:Option<CliProxyInput>)->AppResult<String>{if scope.starts_with("cliproxy:"){return reset_proxy_usage(&cli_proxy.ok_or("请提供 CLIProxyAPI 连接信息。")?,&scope)}let(home,label)=profile_home(&scope)?;let limits=app_server_request(&home,"account/rateLimits/read",json!({"excludeResetCreditDetails":false,"supportsLunaReserve":false}))?;let credit=limits.get("rateLimitResetCredits").and_then(|v|v.get("credits")).and_then(Value::as_array).and_then(|credits|credits.iter().find(|credit|credit.get("status").and_then(Value::as_str)==Some("available"))).and_then(|credit|credit.get("id")).and_then(Value::as_str).ok_or("当前账号没有可用的额度重置次数。")?;let _=app_server_request(&home,"account/rateLimitResetCredit/consume",json!({"creditId":credit,"idempotencyKey":uuid::Uuid::new_v4().to_string()}))?;log_entry("USAGE RESET",&format!("已为“{}”提交一次额度重置。",label));Ok(format!("已为“{}”提交额度重置，正在刷新最新额度。",label))}
 }
 fn auth_token(value:&Value)->Option<String>{value.get("tokens").and_then(|tokens|tokens.get("access_token")).or_else(||value.get("access_token")).and_then(Value::as_str).filter(|token|!token.trim().is_empty()).map(str::to_owned)}
+fn read_auth(home:&Path)->AppResult<Value>{let text=fs::read_to_string(home.join("auth.json")).map_err(|_|"无法读取本地 Codex 登录态。")?;serde_json::from_str(&text).map_err(|_|"本地 Codex 登录态格式无效。".into())}
+fn merge_refreshed_auth(auth:&Value,response:&Value)->AppResult<Value>{let access=response.get("access_token").and_then(Value::as_str).filter(|v|!v.is_empty()).ok_or("刷新服务未返回访问令牌。")?;let mut updated=auth.clone();let target=if updated.get("tokens").is_some(){updated.get_mut("tokens").and_then(Value::as_object_mut)}else{updated.as_object_mut()}.ok_or("本地登录态格式无效。")?;target.insert("access_token".into(),json!(access));for key in ["id_token","refresh_token"]{if let Some(value)=response.get(key).and_then(Value::as_str).filter(|v|!v.is_empty()){target.insert(key.into(),json!(value));}}updated.as_object_mut().ok_or("本地登录态格式无效。")?.insert("last_refresh".into(),json!(chrono::Utc::now().to_rfc3339()));Ok(updated)}
+static AUTH_REFRESH_LOCK:Mutex<()> = Mutex::new(());
+fn refresh_usage_auth(home:&Path,stale_auth:&Value,client:&reqwest::blocking::Client)->AppResult<()> {
+ let _guard=AUTH_REFRESH_LOCK.lock().map_err(|_|"令牌刷新锁不可用。")?;
+ let current=read_auth(home)?;
+ if current!=*stale_auth{return Ok(())}
+ let refresh_token=current.get("tokens").and_then(|v|v.get("refresh_token")).or_else(||current.get("refresh_token")).and_then(Value::as_str).filter(|v|!v.is_empty()).ok_or("登录态缺少刷新令牌，请重新登录该账号。")?;
+ let response=client.post("https://auth.openai.com/oauth/token").json(&json!({"client_id":"app_EMoamEEZ73f0CkXaXp7hrann","grant_type":"refresh_token","refresh_token":refresh_token})).send().map_err(|e|format!("刷新登录态时连接失败：{e}"))?;
+ if !response.status().is_success(){log_entry("USAGE AUTH REFRESH ERROR",&format!("HTTP={}",response.status()));return Err("登录态已过期，自动刷新失败，请重新登录该账号。".into())}
+ let tokens:Value=response.json().map_err(|_|"刷新服务返回的数据无法解析，请重新登录该账号。")?;
+ let latest=read_auth(home)?;
+ if latest!=current{return Ok(())}
+ let updated=merge_refreshed_auth(&latest,&tokens)?;
+ atomic_write(&home.join("auth.json"),&serde_json::to_string_pretty(&updated).map_err(|e|e.to_string())?).map_err(|e|format!("保存更新后的登录态失败：{e}"))?;
+ log_entry("USAGE AUTH REFRESH","额度查询使用的账号令牌已更新。");
+ Ok(())
+}
 fn registry_value(name:&str)->Option<String>{let output=Command::new("reg.exe").args(["query",r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings","/v",name]).creation_flags(0x08000000).output().ok()?;if !output.status.success(){return None}let text=String::from_utf8_lossy(&output.stdout);text.lines().find(|line|line.contains(name)).and_then(|line|line.split_whitespace().last()).map(str::to_owned)}
 fn usage_proxy()->Option<(String,&'static str)>{for key in ["HTTPS_PROXY","https_proxy","ALL_PROXY","all_proxy","HTTP_PROXY","http_proxy"]{if let Ok(value)=std::env::var(key){if !value.trim().is_empty(){return Some((value,"environment"))}}}if registry_value("ProxyEnable").as_deref()!=Some("0x1"){return None}let raw=registry_value("ProxyServer")?;let address=raw.split(';').find_map(|item|item.strip_prefix("https=")).or_else(||raw.split(';').find_map(|item|item.strip_prefix("http="))).unwrap_or(&raw);let url=if address.contains("://"){address.to_string()}else{format!("http://{address}")};Some((url,"Windows system proxy"))}
-fn direct_usage_request(home:&Path,method:&str,path:&str,body:Option<Value>)->AppResult<Value>{let auth:Value=fs::read_to_string(home.join("auth.json")).map_err(|_|"无法读取本地 Codex 登录态。") .and_then(|text|serde_json::from_str(&text).map_err(|_|"本地 Codex 登录态格式无效。".into()))?;let token=auth_token(&auth).ok_or("本地登录态缺少访问令牌，请重新登录。")?;let account=auth_account_id(&auth).ok_or("本地登录态缺少账户标识，请重新登录。")?;let proxy=usage_proxy();let mut builder=reqwest::blocking::Client::builder().timeout(Duration::from_secs(20));if let Some((url,_))=&proxy{builder=builder.proxy(reqwest::Proxy::all(url).map_err(|error|format!("系统代理地址无效：{error}"))?)}let client=builder.build().map_err(|error|format!("创建额度连接失败：{error}"))?;let url=format!("https://chatgpt.com/backend-api/wham/{path}");let request=match method{"GET"=>client.get(&url),"POST"=>client.post(&url),_=>return Err("不支持的额度请求。".into())}.bearer_auth(token).header("Chatgpt-Account-Id",account).header("User-Agent","Codex Idea Tool");let response=match body{Some(body)=>request.json(&body).send(),None=>request.send()}.map_err(|error|{let kind=if error.is_timeout(){"请求超时"}else if error.is_connect(){"连接失败"}else if error.is_request(){"请求错误"}else{"网络错误"};let proxy_source=proxy.as_ref().map(|(_,source)|*source).unwrap_or("direct / TUN");log_entry("USAGE API ERROR",&format!("Endpoint={method} /backend-api/wham/{path}\nProxy={proxy_source}\nType={kind}\nError={error:?}"));format!("无法连接额度服务（{kind}）：{error}")})?;let status=response.status();if !status.is_success(){return Err(format!("额度服务返回 HTTP {status}。"))}let response_text=response.text().map_err(|error|format!("无法读取额度服务响应：{error}"))?;if path=="usage"{let proxy_source=proxy.as_ref().map(|(_,source)|*source).unwrap_or("direct / TUN");log_entry("USAGE API RESPONSE",&format!("Endpoint={method} /backend-api/wham/{path}\nProxy={proxy_source}\nHTTP={status}\nBody={response_text}"));}serde_json::from_str::<Value>(&response_text).map_err(|error|format!("额度服务返回了无法解析的数据：{error}"))}
+fn direct_usage_request(home:&Path,method:&str,path:&str,body:Option<Value>)->AppResult<Value>{direct_usage_request_once(home,method,path,body,true)}
+fn direct_usage_request_once(home:&Path,method:&str,path:&str,body:Option<Value>,allow_refresh:bool)->AppResult<Value>{let auth=read_auth(home)?;let token=auth_token(&auth).ok_or("本地登录态缺少访问令牌，请重新登录。")?;let account=auth_account_id(&auth).ok_or("本地登录态缺少账户标识，请重新登录。")?;let proxy=usage_proxy();let mut builder=reqwest::blocking::Client::builder().timeout(Duration::from_secs(20));if let Some((url,_))=&proxy{builder=builder.proxy(reqwest::Proxy::all(url).map_err(|error|format!("系统代理地址无效：{error}"))?)}let client=builder.build().map_err(|error|format!("创建额度连接失败：{error}"))?;let url=format!("https://chatgpt.com/backend-api/wham/{path}");let request=match method{"GET"=>client.get(&url),"POST"=>client.post(&url),_=>return Err("不支持的额度请求。".into())}.bearer_auth(token).header("Chatgpt-Account-Id",account).header("User-Agent","Codex Idea Tool");let response=match body.clone(){Some(body)=>request.json(&body).send(),None=>request.send()}.map_err(|error|{let kind=if error.is_timeout(){"请求超时"}else if error.is_connect(){"连接失败"}else if error.is_request(){"请求错误"}else{"网络错误"};let proxy_source=proxy.as_ref().map(|(_,source)|*source).unwrap_or("direct / TUN");log_entry("USAGE API ERROR",&format!("Endpoint={method} /backend-api/wham/{path}\nProxy={proxy_source}\nType={kind}\nError={error:?}"));format!("无法连接额度服务（{kind}）：{error}")})?;let status=response.status();if status==reqwest::StatusCode::UNAUTHORIZED&&allow_refresh{refresh_usage_auth(home,&auth,&client)?;return direct_usage_request_once(home,method,path,body,false)}if !status.is_success(){log_entry("USAGE API ERROR",&format!("Endpoint={method} /backend-api/wham/{path}\nHTTP={status}"));return Err(if status==reqwest::StatusCode::UNAUTHORIZED{"登录态已失效，请重新登录该账号。".into()}else{format!("额度服务返回 HTTP {status}。")})}let response_text=response.text().map_err(|error|format!("无法读取额度服务响应：{error}"))?;if path=="usage"{let proxy_source=proxy.as_ref().map(|(_,source)|*source).unwrap_or("direct / TUN");log_entry("USAGE API RESPONSE",&format!("Endpoint={method} /backend-api/wham/{path}\nProxy={proxy_source}\nHTTP={status}\nBody={response_text}"));}serde_json::from_str::<Value>(&response_text).map_err(|error|format!("额度服务返回了无法解析的数据：{error}"))}
+fn direct_usage_profile(scope:String,label:String,home:&Path)->UsageProfile{
+ match direct_usage_request(home,"GET","usage",None){
+  Ok(usage)=>{
+   let credits=if usage.get("rate_limit_reset_credits").or_else(||usage.get("rateLimitResetCredits")).is_some(){None}else{match direct_usage_request(home,"GET","rate-limit-reset-credits",None){Ok(value)=>Some(value),Err(error)=>{log_entry("USAGE CREDITS ERROR",&format!("Account={label}\nError={error}"));None}}};
+   let profile=usage_profile(scope,label.clone(),"direct",usage,credits);
+   log_entry("USAGE PARSED",&format!("Account={label}\nPrimary={}\nSecondary={}\nMonthly={}\nResetCredits={}",profile.primary.as_ref().map(|window|format!("remaining={}%, resets_at={:?}",window.remaining_percent,window.resets_at)).unwrap_or_else(||"null".into()),profile.secondary.as_ref().map(|window|format!("remaining={}%, resets_at={:?}",window.remaining_percent,window.resets_at)).unwrap_or_else(||"null".into()),profile.monthly.as_ref().map(|window|format!("remaining={}%, resets_at={:?}",window.remaining_percent,window.resets_at)).unwrap_or_else(||"null".into()),profile.reset_credits));
+   profile
+  },
+  Err(error)=>{log_entry("USAGE ERROR",&format!("Account={label}\nError={error}"));usage_error(scope,label,"direct",error)}
+ }
+}
 fn direct_usage_limits()->AppResult<Vec<UsageProfile>>{
  let accounts=load_accounts()?;
  let mut candidates=vec![];
@@ -129,24 +203,102 @@ fn direct_usage_limits()->AppResult<Vec<UsageProfile>>{
  for(scope,label,home)in candidates{
   let identity=auth_account_id_at(&home.join("auth.json")).unwrap_or_else(||scope.clone());
   if !seen.insert(identity){continue}
-  match(direct_usage_request(&home,"GET","usage",None),direct_usage_request(&home,"GET","rate-limit-reset-credits",None)){
-   (Ok(usage),Ok(credits))=>{
-    let profile=usage_profile(scope,label.clone(),"direct",usage,Some(credits));
-    log_entry("USAGE PARSED",&format!("Account={label}\nPrimary={}\nSecondary={}\nResetCredits={}",profile.primary.as_ref().map(|window|format!("remaining={}%, resets_at={:?}",window.remaining_percent,window.resets_at)).unwrap_or_else(||"null".into()),profile.secondary.as_ref().map(|window|format!("remaining={}%, resets_at={:?}",window.remaining_percent,window.resets_at)).unwrap_or_else(||"null".into()),profile.reset_credits));
-    profiles.push(profile);
-   },
-   (Err(error),_)|(_,Err(error))=>{
-    log_entry("USAGE ERROR",&format!("Account={label}\nError={error}"));
-    profiles.push(usage_error(scope,label,"direct",error));
-   }
-  }
+  profiles.push(direct_usage_profile(scope,label,&home));
  }
  if profiles.is_empty(){Err("没有已登录的 Codex 账号可查询。".into())}else{Ok(profiles)}
 }
 #[tauri::command] async fn load_usage_limits()->AppResult<Vec<UsageProfile>>{tauri::async_runtime::spawn_blocking(direct_usage_limits).await.map_err(|error|format!("额度后台任务异常：{error}"))?}
-#[tauri::command] async fn load_usage_limit(scope:String)->AppResult<UsageProfile>{tauri::async_runtime::spawn_blocking(move||direct_usage_limits()?.into_iter().find(|profile|profile.scope==scope).ok_or("未找到该账号的额度信息。".into())).await.map_err(|error|format!("额度后台任务异常：{error}"))?}
+#[tauri::command] async fn load_usage_limit(scope:String)->AppResult<UsageProfile>{tauri::async_runtime::spawn_blocking(move||{let(home,label)=profile_home(&scope)?;Ok(direct_usage_profile(scope,label,&home))}).await.map_err(|error|format!("额度后台任务异常：{error}"))?}
 fn reset_usage_limit_blocking(scope:String)->AppResult<String>{let(home,label)=profile_home(&scope)?;let credits=direct_usage_request(&home,"GET","rate-limit-reset-credits",None)?;let credit=credits.get("credits").and_then(Value::as_array).and_then(|items|items.iter().find(|item|item.get("status").and_then(Value::as_str)==Some("available"))).and_then(|item|item.get("id")).and_then(Value::as_str).ok_or("当前账号没有可用的额度重置次数。")?;let _=direct_usage_request(&home,"POST","rate-limit-reset-credits/consume",Some(json!({"credit_id":credit,"redeem_request_id":uuid::Uuid::new_v4().to_string()})))?;log_entry("USAGE RESET",&format!("已为“{}”提交一次额度重置。",label));Ok(format!("已为“{}”提交额度重置，正在刷新最新额度。",label))}
 #[tauri::command] async fn reset_usage_limit(scope:String)->AppResult<String>{tauri::async_runtime::spawn_blocking(move||reset_usage_limit_blocking(scope)).await.map_err(|error|format!("额度重置后台任务异常：{error}"))?}
+
+const WINDOW_START_PROMPT:&str="你好";
+fn log_preview(value:&str)->String {let mut text=value.chars().take(4000).collect::<String>();if value.chars().count()>4000{text.push_str("…[已截断]")}text}
+fn completed_response_text(event:&Value)->Option<String>{
+ let output=event.get("response")?.get("output")?.as_array()?;
+ let text=output.iter().filter_map(|item|item.get("content").and_then(Value::as_array))
+  .flatten().filter_map(|part|part.get("text").and_then(Value::as_str))
+  .collect::<Vec<_>>().join("");
+ if text.is_empty(){None}else{Some(text)}
+}
+fn start_usage_window_blocking(scope:String,slot:String)->AppResult<String>{
+ let (home,label)=profile_home(&scope)?;
+ let mut selected_model=String::new();
+ let result=send_window_message(&home,true,&label,&slot,&mut selected_model);
+ let record=ScheduledMessageRecord{
+  recorded_at:Local::now().to_rfc3339(),account:label.clone(),scheduled_slot:slot.clone(),
+  model:selected_model,prompt:WINDOW_START_PROMPT.into(),
+  status:if result.is_ok(){"completed".into()}else{"failed".into()},
+  response:result.as_ref().map(|(_,answer)|redact(&log_preview(answer))).unwrap_or_default(),
+  error:result.as_ref().err().map(|error|redact(&log_preview(error))).unwrap_or_default(),
+ };
+ append_scheduled_message(&record);
+ match result{
+  Ok((model,answer))=>{
+   log_entry("USAGE WINDOW RESULT",&format!("Account={label}\nScheduledSlot={slot}\nModel={model}\nStatus=completed\nResponse={}",log_preview(&answer)));
+   Ok(format!("{label} · 发送：{WINDOW_START_PROMPT} · 回复：{}",log_preview(&answer)))
+  },
+  Err(error)=>{
+   log_entry("USAGE WINDOW RESULT",&format!("Account={label}\nScheduledSlot={slot}\nStatus=failed\nError={error}"));
+   Err(error)
+  }
+ }
+}
+fn send_window_message(home:&Path,allow_refresh:bool,label:&str,slot:&str,selected_model:&mut String)->AppResult<(String,String)> {
+ let auth=read_auth(home)?;
+ let token=auth_token(&auth).ok_or("本地登录态缺少访问令牌，请重新登录。")?;
+ let account=auth_account_id(&auth).ok_or("本地登录态缺少账户标识，请重新登录。")?;
+ let mut builder=reqwest::blocking::Client::builder().timeout(Duration::from_secs(90));
+ if let Some((url,_))=usage_proxy(){builder=builder.proxy(reqwest::Proxy::all(&url).map_err(|error|format!("系统代理地址无效：{error}"))?)}
+ let client=builder.build().map_err(|error|format!("创建 Codex 连接失败：{error}"))?;
+ let model=client.get("https://chatgpt.com/backend-api/codex/models")
+  .bearer_auth(&token).header("Chatgpt-Account-Id",&account).send().ok()
+  .filter(|response|response.status().is_success())
+  .and_then(|response|response.json::<Value>().ok())
+  .and_then(|catalog|catalog.get("models").and_then(Value::as_array).and_then(|models|{
+   models.iter().filter_map(|item|item.get("slug").and_then(Value::as_str))
+    .find(|slug|*slug=="gpt-6-luna")
+    .or_else(||models.iter().filter_map(|item|item.get("slug").and_then(Value::as_str)).next())
+    .map(str::to_owned)
+  })).unwrap_or_else(||"gpt-6-luna".into());
+ *selected_model=model.clone();
+ let body=json!({"model":model,"instructions":"只回复‘已收到’。不要调用工具。","input":[{"role":"user","content":"你好"}],"tools":[],"store":false,"stream":true});
+ log_entry("USAGE WINDOW REQUEST",&format!("Account={label}\nScheduledSlot={slot}\nEndpoint=POST /backend-api/codex/responses\nModel={model}\nMessage={WINDOW_START_PROMPT}"));
+ let response=client.post("https://chatgpt.com/backend-api/codex/responses")
+  .bearer_auth(token).header("Chatgpt-Account-Id",account).header("User-Agent","Codex Idea Tool")
+  .header("Accept","text/event-stream").json(&body).send()
+  .map_err(|error|format!("发送 Codex 消息失败：{error}"))?;
+ let status=response.status();
+ if status==reqwest::StatusCode::UNAUTHORIZED&&allow_refresh{refresh_usage_auth(home,&auth,&client)?;return send_window_message(home,false,label,slot,selected_model)}
+ if !status.is_success(){return Err(format!("Codex 消息接口返回 HTTP {status}。"))}
+ let mut reader=BufReader::new(response);
+ let mut line=String::new();
+ let mut bytes=0usize;
+ let mut answer=String::new();
+ loop{
+  line.clear();
+  let size=reader.read_line(&mut line).map_err(|error|format!("读取 Codex 响应失败：{error}"))?;
+  if size==0{break}
+  bytes+=size;
+  if bytes>2_000_000{return Err("Codex 响应超过大小限制。".into())}
+  if let Some(data)=line.trim().strip_prefix("data: "){
+   if let Ok(value)=serde_json::from_str::<Value>(data){
+    match value.get("type").and_then(Value::as_str){
+     Some("response.output_text.delta")=>{if let Some(delta)=value.get("delta").and_then(Value::as_str){if answer.len()<8000{answer.push_str(delta)}}},
+     Some("response.completed")=>{
+      if answer.is_empty(){answer=completed_response_text(&value).unwrap_or_default()}
+      return Ok((model,if answer.is_empty(){"（服务端未返回文本）".into()}else{answer}))
+     },
+     Some("response.failed")|Some("error")=>return Err("Codex 未能完成定时消息，请查看账号状态。".into()),
+     _=>{},
+    }
+   }
+  }
+ }
+ Err("Codex 响应未包含完成事件，本次发送状态无法确认。".into())
+}
+#[tauri::command] async fn start_usage_window(scope:String,slot:String)->AppResult<String>{tauri::async_runtime::spawn_blocking(move||start_usage_window_blocking(scope,slot)).await.map_err(|error|format!("定时消息后台任务异常：{error}"))?}
+#[tauri::command] async fn send_manual_message(scope:String)->AppResult<String>{tauri::async_runtime::spawn_blocking(move||start_usage_window_blocking(scope,"手动发送".into())).await.map_err(|error|format!("手动消息后台任务异常：{error}"))?}
 fn load_providers()->AppResult<Vec<Provider>>{
  let store=providers_path()?;let saved:Vec<Provider>=read_json(&store);if !saved.is_empty()||store.exists(){return Ok(saved)}
  let cfg=config_path()?;let Ok(text)=fs::read_to_string(&cfg)else{return Ok(vec![])};
@@ -184,7 +336,7 @@ fn write_runtime(p:&Provider)->AppResult<()> {
  let entries:Vec<Value>=models.iter().enumerate().map(|(i,m)|{let r=p.reasoning_by_model.get(m).cloned().unwrap_or_else(default_reasoning);let levels=if r.levels.is_empty(){default_reasoning().levels}else{r.levels};let def=if r.default_level=="auto"||!levels.contains(&r.default_level){if levels.iter().any(|x|x=="high"){"high".into()}else{levels[0].clone()}}else{r.default_level};json!({"slug":m,"display_name":format!("{} · {}",p.name,m),"description":format!("{} model: {}",p.name,m),"base_instructions":"You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.","default_reasoning_level":def,"supported_reasoning_levels":levels.iter().map(|x|json!({"effort":x,"description":format!("思考等级：{}",x)})).collect::<Vec<_>>(),"shell_type":"shell_command","visibility":"list","supported_in_api":true,"priority":i,"supports_reasoning_summaries":true,"default_reasoning_summary":"none","support_verbosity":false,"truncation_policy":{"mode":"bytes","limit":10000},"supports_parallel_tool_calls":false,"supports_image_detail_original":false,"context_window":262144,"max_context_window":262144,"effective_context_window_percent":95,"experimental_supported_tools":[],"input_modalities":["text","image"],"supports_search_tool":false})}).collect();
  atomic_write(&cat,&serde_json::to_string_pretty(&json!({"models":entries})).map_err(|e|e.to_string())?)?;log_entry("RUNTIME CONFIG",&format!("Provider={}\nModel={}\nBaseUrl={}\nProtocol={}\nConfig={}\nCatalog={}\nModelsVisibleToIdea={}",p.id,p.model,p.url,p.protocol,cfg.display(),cat.display(),models.join(", ")));Ok(())
 }
-fn recent_logs()->Vec<String>{let Ok(dir)=logs_dir()else{return vec![]};let mut f=fs::read_dir(dir).ok().into_iter().flatten().filter_map(|x|x.ok()).map(|x|x.path()).filter(|p|p.extension().and_then(|x|x.to_str())==Some("log")).collect::<Vec<_>>();f.sort();f.reverse();let all=f.into_iter().take(2).filter_map(|p|fs::read_to_string(p).ok()).collect::<Vec<_>>().join("");let lines=all.lines().collect::<Vec<_>>();let skip=lines.len().saturating_sub(180);lines.into_iter().skip(skip).map(str::to_owned).collect()}
+fn recent_logs()->Vec<String>{let Ok(dir)=logs_dir()else{return vec![]};prune_logs_at(&dir,Local::now().date_naive());let mut f=fs::read_dir(dir).ok().into_iter().flatten().filter_map(|x|x.ok()).map(|x|x.path()).filter(|p|p.extension().and_then(|x|x.to_str())==Some("log")).collect::<Vec<_>>();f.sort();f.reverse();let all=f.into_iter().take(2).filter_map(|p|fs::read_to_string(p).ok()).collect::<Vec<_>>().join("");let lines=all.lines().collect::<Vec<_>>();let skip=lines.len().saturating_sub(180);lines.into_iter().skip(skip).map(str::to_owned).collect()}
 
 #[tauri::command] fn load_app_data()->AppResult<AppData>{let ps=load_providers()?;let accounts=load_accounts()?;let runtime_status=runtime_status(&accounts);Ok(AppData{providers:ps.iter().map(ProviderView::from).collect(),accounts:accounts.into_iter().map(|a|{let logged=profiles_dir().map(|p|p.join(&a.id).join("auth.json").exists()).unwrap_or(false);AccountView{id:a.id,name:a.name,logged_in:logged}}).collect(),runtime_status,recent_logs:recent_logs(),config_dir:config_dir()?.to_string_lossy().into(),profiles_dir:profiles_dir()?.to_string_lossy().into(),logs_dir:logs_dir()?.to_string_lossy().into()})}
 
@@ -227,14 +379,41 @@ mod tests {
  #[test] fn auth_account_id_supports_current_and_legacy_formats(){let current:Value=serde_json::from_str(r#"{"auth_mode":"chatgpt","tokens":{"account_id":"current-account"}}"#).unwrap();let legacy:Value=serde_json::from_str(r#"{"account_id":"legacy-account"}"#).unwrap();assert_eq!(auth_account_id(&current).as_deref(),Some("current-account"));assert_eq!(auth_account_id(&legacy).as_deref(),Some("legacy-account"));}
  #[test] fn usage_profile_exposes_remaining_windows_and_credit_count(){let result:Value=serde_json::from_str(r#"{"rateLimits":{"planType":"plus","primary":{"usedPercent":25,"resetsAt":100},"secondary":{"usedPercent":80,"resetsAt":200}},"rateLimitResetCredits":{"availableCount":2}}"#).unwrap();let profile=usage_profile("default".into(),"默认".into(),"local",result,None);assert_eq!(profile.primary.unwrap().remaining_percent,75.0);assert_eq!(profile.secondary.unwrap().remaining_percent,20.0);assert_eq!(profile.reset_credits,2);assert_eq!(profile.plan_type.as_deref(),Some("plus"));}
  #[test] fn direct_usage_profile_parses_snake_case_windows_and_credits(){let usage:Value=serde_json::from_str(r#"{"rate_limit":{"plan_type":"pro","primary_window":{"used_percent":40,"reset_at":100},"secondary_window":{"used_percent":90,"reset_at":200}}}"#).unwrap();let credits:Value=serde_json::from_str(r#"{"credits":[{"id":"a","status":"available"},{"id":"b","status":"used"}]}"#).unwrap();let profile=usage_profile("default".into(),"work".into(),"direct",usage,Some(credits));assert_eq!(profile.primary.unwrap().remaining_percent,60.0);assert_eq!(profile.secondary.unwrap().remaining_percent,10.0);assert_eq!(profile.reset_credits,1);assert_eq!(profile.plan_type.as_deref(),Some("pro"));}
+ #[test] fn usage_response_contains_weekly_limit_and_reset_credits(){let usage=json!({"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":1790419272},"secondary_window":null},"rate_limit_reset_credits":{"available_count":1}});let profile=usage_profile("default".into(),"work".into(),"direct",usage,None);assert!(profile.primary.is_none());assert_eq!(profile.secondary.unwrap().remaining_percent,0.0);assert_eq!(profile.reset_credits,1);assert_eq!(profile.plan_type.as_deref(),Some("plus"));}
  #[test] fn single_week_window_is_exposed_as_secondary(){let usage:Value=serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_at":200}}}"#).unwrap();let profile=usage_profile("default".into(),"work".into(),"direct",usage,None);assert!(profile.primary.is_none());assert_eq!(profile.secondary.unwrap().remaining_percent,0.0);}
  #[test] fn single_month_window_is_exposed_as_monthly(){let usage:Value=serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":51,"limit_window_seconds":2592000,"reset_at":200}}}"#).unwrap();let profile=usage_profile("default".into(),"work".into(),"direct",usage,None);assert!(profile.primary.is_none());assert!(profile.secondary.is_none());assert_eq!(profile.monthly.unwrap().remaining_percent,49.0);}
  #[test] fn window_duration_wins_when_api_field_order_is_reversed(){let usage:Value=serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":80,"limit_window_seconds":604800,"reset_at":200},"secondary_window":{"used_percent":25,"limit_window_seconds":18000,"reset_at":100}}}"#).unwrap();let profile=usage_profile("default".into(),"work".into(),"direct",usage,None);assert_eq!(profile.primary.unwrap().remaining_percent,75.0);assert_eq!(profile.secondary.unwrap().remaining_percent,20.0);}
  #[test] fn auth_token_supports_current_and_legacy_formats(){let current:Value=serde_json::from_str(r#"{"tokens":{"access_token":"current-token"}}"#).unwrap();let legacy:Value=serde_json::from_str(r#"{"access_token":"legacy-token"}"#).unwrap();assert_eq!(auth_token(&current).as_deref(),Some("current-token"));assert_eq!(auth_token(&legacy).as_deref(),Some("legacy-token"));}
+ #[test] fn refreshed_auth_preserves_account_and_rotates_tokens(){let auth=json!({"auth_mode":"chatgpt","tokens":{"account_id":"account-1","access_token":"old","refresh_token":"old-refresh","id_token":"old-id"},"custom":"keep"});let updated=merge_refreshed_auth(&auth,&json!({"access_token":"new","refresh_token":"new-refresh","id_token":"new-id"})).unwrap();assert_eq!(auth_token(&updated).as_deref(),Some("new"));assert_eq!(updated["tokens"]["refresh_token"],"new-refresh");assert_eq!(updated["tokens"]["id_token"],"new-id");assert_eq!(auth_account_id(&updated).as_deref(),Some("account-1"));assert_eq!(updated["custom"],"keep");assert!(updated.get("last_refresh").is_some());}
+ #[test] fn refreshed_auth_rejects_missing_access_token(){let auth=json!({"tokens":{"access_token":"old"}});assert!(merge_refreshed_auth(&auth,&json!({"refresh_token":"new"})).is_err());}
+ #[test] fn completed_window_response_extracts_visible_reply(){let event=json!({"type":"response.completed","response":{"output":[{"content":[{"type":"output_text","text":"已收到"}]}]}});assert_eq!(completed_response_text(&event).as_deref(),Some("已收到"));assert_eq!(completed_response_text(&json!({"response":{"output":[]}})),None);}
+ #[test] fn window_log_preview_limits_long_replies(){let text="中".repeat(4001);assert_eq!(log_preview(&text).chars().count(),4006);assert!(log_preview(&text).ends_with("…[已截断]"));}
+ #[test] fn daily_logs_keep_today_and_previous_six_days(){
+  let dir=std::env::temp_dir().join(format!("codex-idea-log-test-{}",uuid::Uuid::new_v4()));fs::create_dir_all(&dir).unwrap();
+  for name in ["ci-2026-10-19.log","ci-2026-10-20.log","ci-2026-10-26.log","scheduled-messages-2026-10-19.jsonl","scheduled-messages-2026-10-20.jsonl","notes.log","ci-2026-10-19.log.backup"]{fs::write(dir.join(name),"test").unwrap()}
+  let today=NaiveDate::from_ymd_opt(2026,10,26).unwrap();
+  assert_eq!(prune_logs_at(&dir,today),2);
+  assert!(!dir.join("ci-2026-10-19.log").exists());
+  assert!(!dir.join("scheduled-messages-2026-10-19.jsonl").exists());
+  for name in ["ci-2026-10-20.log","ci-2026-10-26.log","scheduled-messages-2026-10-20.jsonl","notes.log","ci-2026-10-19.log.backup"]{assert!(dir.join(name).exists(),"{name}")}
+  fs::remove_dir_all(dir).unwrap();
+ }
+ #[test] fn scheduled_message_history_reads_newest_valid_records(){
+  let dir=std::env::temp_dir().join(format!("codex-idea-message-test-{}",uuid::Uuid::new_v4()));fs::create_dir_all(&dir).unwrap();
+  let record=|time:&str|ScheduledMessageRecord{recorded_at:time.into(),account:"OpenAI · test".into(),scheduled_slot:"2026-10-26 06:00".into(),model:"gpt-6-luna".into(),prompt:"你好".into(),status:"completed".into(),response:"已收到".into(),error:String::new()};
+  let older=serde_json::to_string(&record("2026-10-26T06:00:00+08:00")).unwrap();
+  let newer=serde_json::to_string(&record("2026-10-26T12:00:00+08:00")).unwrap();
+  fs::write(dir.join("scheduled-messages-2026-10-26.jsonl"),format!("{older}\ninvalid\n{newer}\n")).unwrap();
+  fs::write(dir.join("ci-2026-10-26.log"),"not a message record").unwrap();
+  let records=read_scheduled_message_history(&dir);
+  assert_eq!(records.len(),2);assert_eq!(records[0].recorded_at,"2026-10-26T12:00:00+08:00");assert_eq!(records[0].response,"已收到");
+  fs::remove_dir_all(dir).unwrap();
+ }
+ #[test] fn atomic_write_replaces_existing_auth_file(){let dir=std::env::temp_dir().join(format!("codex-idea-auth-test-{}",uuid::Uuid::new_v4()));fs::create_dir_all(&dir).unwrap();let path=dir.join("auth.json");fs::write(&path,"old").unwrap();let result=atomic_write(&path,"new");assert!(result.is_ok(),"{result:?}");assert_eq!(fs::read_to_string(&path).unwrap(),"new");fs::remove_dir_all(dir).unwrap();}
  #[test] fn account_export_bundle_round_trips(){let bundle=AccountExportBundle{format:"codex-idea-tool-accounts".into(),version:1,exported_at:"2026-09-18T00:00:00+08:00".into(),accounts:vec![AccountExport{name:"工作账号".into(),auth:json!({"auth_mode":"chatgpt","tokens":{"account_id":"account-1"}})}]};let text=serde_json::to_string(&bundle).unwrap();let decoded:AccountExportBundle=serde_json::from_str(&text).unwrap();assert_eq!(decoded.format,"codex-idea-tool-accounts");assert_eq!(decoded.accounts.len(),1);assert_eq!(auth_account_id(&decoded.accounts[0].auth).as_deref(),Some("account-1"));}
  #[test] fn imported_account_names_are_made_unique(){let accounts=vec![Account{id:"1".into(),name:"工作账号".into()},Account{id:"2".into(),name:"工作账号 (2)".into()}];assert_eq!(unique_account_name(&accounts,"工作账号"),"工作账号 (3)");assert_eq!(unique_account_name(&accounts,"个人账号"),"个人账号");}
  #[test] fn provider_store_load_is_safe_without_machine_data(){let _=load_providers().expect("provider loading should not fail when machine data is absent");}
  #[test] fn log_redaction_hides_bearer(){assert!(!redact("Authorization: Bearer secret-value").contains("secret-value"));}
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)] pub fn run(){tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app,_,_|{if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.set_focus();}})).setup(|app|{if cfg!(debug_assertions){app.handle().plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Info).build())?;}Ok(())}).invoke_handler(tauri::generate_handler![load_app_data,load_usage_limits,load_usage_limit,reset_usage_limit,save_provider,delete_provider,fetch_models,test_provider,add_account,login_account,import_account_auth,export_account,export_all_accounts,import_all_accounts,delete_account,launch_idea,open_app_dir,restore_latest_backup,clean_backups]).run(tauri::generate_context!()).expect("error while running tauri application");}
+#[cfg_attr(mobile, tauri::mobile_entry_point)] pub fn run(){tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app,_,_|{if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.set_focus();}})).setup(|app|{if cfg!(debug_assertions){app.handle().plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Info).build())?;}Ok(())}).invoke_handler(tauri::generate_handler![load_app_data,load_usage_limits,load_usage_limit,reset_usage_limit,start_usage_window,send_manual_message,load_scheduled_message_history,save_provider,delete_provider,fetch_models,test_provider,add_account,login_account,import_account_auth,export_account,export_all_accounts,import_all_accounts,delete_account,launch_idea,open_app_dir,restore_latest_backup,clean_backups]).run(tauri::generate_context!()).expect("error while running tauri application");}
